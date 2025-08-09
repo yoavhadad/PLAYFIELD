@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RTSP → YOLO11n (TensorRT) on Jetson Orin NX / JetPack 6.1
+
+- קורא סטרים RTSP בעיכוב נמוך דרך GStreamer עם nvv4l2decoder (האצת NVDEC)
+- מריץ Ultralytics YOLO11n על GPU; מועדף .engine (TensorRT). אם אין, ינסה yolo11n.pt
+- מצייר בוקסות וזיהויים; ניתן להציג חלון או להריץ headless
+
+שימוש לדוגמה:
+  python3 rtsp_yolo11_trt.py --rtsp rtsp://user:pass@IP:554/stream --codec h264 --model yolo11n.engine --show
+"""
+
+import os
+import sys
+import time
+import argparse
+import logging
+import signal
+
+import cv2
+import numpy as np
+
+try:
+    import torch
+    torch.backends.cudnn.benchmark = True  # אופטימיזציה לדאטה חוזר
+except Exception:
+    torch = None
+
+from ultralytics import YOLO
+
+
+def make_gst_pipeline(rtsp_url: str,
+                      codec: str = "h264",
+                      latency: int = 50,
+                      tcp: bool = True) -> str:
+    """
+    בונה צינור GStreamer בעיכוב נמוך עם פענוח בחומרה.
+    codec: 'h264' או 'h265'
+    latency: מילישניות ב-jitterbuffer של rtspsrc
+    tcp: שימוש ב-TCP (יציב יותר) או UDP
+    """
+    depay_parse = "rtph265depay ! h265parse" if codec.lower() == "h265" else "rtph264depay ! h264parse"
+    proto = "tcp" if tcp else "udp"
+
+    pipeline = (
+        f"rtspsrc location={rtsp_url} latency={latency} protocols={proto} ! "
+        f"{depay_parse} ! "
+        "nvv4l2decoder enable-max-performance=1 ! "
+        # המרה לזיכרון CPU בפורמט BGRA (ביצועים טובים), קבלה כ-NumPy דרך appsink
+        "nvvidconv ! video/x-raw, format=BGRx ! "
+        "appsink drop=true sync=false max-buffers=1"
+    )
+    return pipeline
+
+
+def open_capture(rtsp_url: str, codec: str, latency: int, tcp: bool):
+    """מנסה לפתוח עם GStreamer; אם נכשל, נופל ל-FFmpeg (פחות יעיל)."""
+    gst = make_gst_pipeline(rtsp_url, codec=codec, latency=latency, tcp=tcp)
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        return cap, "gstreamer"
+    # Fallback (ללא האצת חומרה)
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    return cap, "ffmpeg"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RTSP → YOLO11n (TensorRT) על Jetson Orin NX")
+    parser.add_argument("--rtsp", required=True, help="כתובת RTSP של המצלמה")
+    parser.add_argument("--codec", default="h264", choices=["h264", "h265"], help="קידוד הווידאו ב-RTSP")
+    parser.add_argument("--latency", type=int, default=50, help="לאטנסי של rtspsrc במילישניות (ברירת מחדל 50)")
+    parser.add_argument("--udp", action="store_true", help="העדפת UDP במקום TCP (מוגדר TCP כברירת מחדל)")
+    parser.add_argument("--model", default="yolo11n.engine", help="מודל Ultralytics (.engine מועדף, אחרת .pt)")
+    parser.add_argument("--imgsz", type=int, default=640, help="גודל תמונה למודל")
+    parser.add_argument("--conf", type=float, default=0.25, help="סף ביטחון לזיהוי")
+    parser.add_argument("--device", default="0", help="מכשיר להרצה ('0' ל-GPU הראשי, או 'cpu')")
+    parser.add_argument("--show", action="store_true", help="הצגת חלון עם תוצאות")
+    parser.add_argument("--save", default="", help="שמירת וידאו לנתיב זה (אופציונלי, mp4)")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+
+    # סגירה נקייה ב-CTRL+C
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    # טעינת מודל
+    model_path = args.model
+    if not os.path.exists(model_path):
+        fallback = "yolo11n.pt" if model_path.endswith(".engine") else model_path
+        logging.warning("הקובץ %s לא נמצא. מעבר ל-%s", model_path, fallback)
+        model_path = fallback
+
+    logging.info("טוען מודל: %s", model_path)
+    model = YOLO(model_path)
+
+    # פתיחת הזרם
+    cap, backend = open_capture(args.rtsp, codec=args.codec, latency=args.latency, tcp=not args.udp)
+    if not cap.isOpened():
+        logging.error("פתיחת ה‑RTSP נכשלה. ודא שה‑URL תקין וש-GStreamer/FFmpeg מותקנים.")
+        sys.exit(1)
+    logging.info("נפתח בהצלחה דרך: %s", backend)
+
+    # הכנה לכתיבה (אם נדרש)
+    writer = None
+    if args.save:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # ננסה לקרוא מאפייני וידאו מהמקור; אחרת ניפול לברירות מחדל
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = float(fps if fps and fps > 0 else 30.0)
+        writer = cv2.VideoWriter(args.save, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            logging.warning("פתיחת writer נכשלה; לא יישמר וידאו.")
+            writer = None
+
+    # Warmup קצר להאצת cudnn/engine
+    if torch is not None and (args.device != "cpu"):
+        dummy = np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8)
+        _ = model.predict(dummy, imgsz=args.imgsz, device=args.device, verbose=False)
+
+    t0 = time.time()
+    frames = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            logging.warning("כשל בקריאת פריים מה‑RTSP; מנסה להמשיך…")
+            time.sleep(0.05)
+            continue
+
+        # אם הגיע BGRA מ‑appsink → המרה ל‑BGR עבור OpenCV/YOLO
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        # הרצה
+        results = model.predict(
+            frame,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            device=args.device,
+            verbose=False
+        )
+        annotated = results[0].plot()  # ציור תיבות/תוויות
+
+        if args.show:
+            cv2.imshow("YOLO11n (TensorRT) — Jetson Orin NX", annotated)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+                break
+
+        if writer is not None:
+            writer.write(annotated)
+
+        frames += 1
+        if frames % 30 == 0:
+            dt = time.time() - t0
+            fps = frames / max(dt, 1e-6)
+            logging.info("FPS ממוצע: %.1f", fps)
+
+    # ניקוי
+    if writer is not None:
+        writer.release()
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
